@@ -1,8 +1,8 @@
 from __future__ import print_function
 
 import datetime
-import json
 import os.path
+from typing import Optional, Sequence, TypedDict
 
 from flask import Flask, jsonify, redirect, request, session, url_for
 from google.auth.transport.requests import Request
@@ -13,51 +13,71 @@ from googleapiclient.errors import HttpError
 
 # If modifying these scopes, delete the file token.json.
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY")
+app.config["SESSION_TYPE"] = "filesystem"
+
+
+CALLBACK_URL = os.environ.get("CALLBACK_URL")
+API_CLIENT_ID = os.environ.get("API_CLIENT_ID")
+API_CLIENT_SECRET = os.environ.get("API_CLIENT_SECRET")
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+
+class CredentialsPayload(TypedDict):
+    token: str
+    refresh_token: Optional[str]
+    token_uri: str
+    client_id: str
+    client_secret: str
+    scopes: str
 
 
 class CalendarClient:
-    SCOPES = ["https://www.googleapis.com/auth/calendar"]
     API_SERVICE = "calendar"
     API_VERSION = "v3"
-    TOKEN_FILE = "token.json"
-    API_CLIENT_ID = os.environ.get("API_CLIENT_ID")
-    API_CLIENT_SECRET = os.environ.get("API_CLIENT_SECRET")
-    CLIENT_CONFIG = {
-        "web": {
-            "client_id": API_CLIENT_ID,
-            "client_secret": API_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
+
+    def __init__(self, client_id: str, client_secret: str, scopes: Sequence[str]):
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._scopes = scopes
+        self._client_config = {
+            "web": {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
         }
-    }
 
-    @classmethod
-    def get_flow(cls, callback_url):
-        return Flow.from_client_config(
-            cls.CLIENT_CONFIG, cls.SCOPES, redirect_uri=callback_url
-        )
-
-    @classmethod
-    def get_auth_url(cls, callback_url):
-        flow = cls.get_flow(callback_url)
+    def get_auth_url(self, callback_url: str) -> str:
+        flow = self._get_flow(callback_url)
         auth_url, _ = flow.authorization_url(
             access_type="offline", include_granted_scopes="true"
         )
-
         return auth_url
 
-    @classmethod
-    def get_credentials(cls, code, callback_url):
-        flow = cls.get_flow(callback_url)
-        flow.fetch_token(
-            code=code,
-        )
+    def get_credentials(self, code: str, callback_url: str) -> Credentials:
+        flow = self._get_flow(callback_url)
+        flow.fetch_token(code=code)
         return flow.credentials
 
-    @classmethod
-    def get_upcoming_events(cls, n: int = 10) -> list[dict]:
+    def refresh_credentials(
+        self, credentials_payload: CredentialsPayload
+    ) -> Credentials:
+        credentials = Credentials.from_authorized_user_info(credentials_payload)
+        if not credentials.valid:
+            if credentials and credentials.expired and credentials.refresh_token:
+                credentials.refresh(Request())
+        return credentials
+
+    def get_upcoming_events(
+        self,
+        credentials_payload: CredentialsPayload,
+        n: int = 10,
+    ) -> list[dict]:
         try:
-            service = cls._build_service()
+            credentials = self.refresh_credentials(credentials_payload)
+            service = self._build_service(credentials)
             now = datetime.datetime.utcnow().isoformat() + "Z"  # 'Z' indicates UTC time
             print(f"Getting the upcoming {n} events")
             events_result = (
@@ -81,22 +101,21 @@ class CalendarClient:
             print("An error occurred: %s" % error)
             return []
 
-    @classmethod
-    def _build_service(cls):
-        return build(
-            cls.API_SERVICE, cls.API_VERSION, credentials=cls._get_credentials()
+    def _get_flow(self, callback_url: str) -> Flow:
+        return Flow.from_client_config(
+            self._client_config, self._scopes, redirect_uri=callback_url
         )
 
-
-def main():
-    events = CalendarClient.get_upcoming_events(20)
-    for event in events:
-        start = event["start"].get("dateTime", event["start"].get("date"))
-        print(start, event)
+    def _build_service(self, credentials: Credentials):
+        return build(self.API_SERVICE, self.API_VERSION, credentials=credentials)
 
 
-if __name__ == "__main__":
-    main()
+client = CalendarClient(API_CLIENT_ID, API_CLIENT_SECRET, SCOPES)
+
+
+def is_authenticated() -> Optional[CredentialsPayload]:
+    if session.get("credentials"):
+        return session["credentials"]
 
 
 @app.route("/")
@@ -106,26 +125,32 @@ def hello_world():
 
 @app.route("/callback")
 def callback():
-    creds = CalendarClient.get_credentials(
+    credentials = client.get_credentials(
         code=request.args.get("code"),
-        callback_url="https://a74a-2a02-a31a-c23d-df80-d36f-b656-373-66f8.eu.ngrok.io/callback",
+        callback_url=CALLBACK_URL,
     )
-    # store it ine a session
-    return creds.to_json()
+    session["credentials"] = {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": credentials.scopes,
+    }
+    return credentials.to_json()
 
 
 @app.route("/auth")
 def auth():
-    return redirect(
-        CalendarClient.get_auth_url(
-            "https://a74a-2a02-a31a-c23d-df80-d36f-b656-373-66f8.eu.ngrok.io/callback"
-        )
-    )
+    return redirect(client.get_auth_url(CALLBACK_URL))
 
 
 @app.route("/events")
 def events():
-    events = CalendarClient.get_upcoming_events(20)
+    credentials_payload = is_authenticated()
+    if not credentials_payload:
+        return redirect(url_for("auth"))
+    events = client.get_upcoming_events(credentials_payload, n=15)
     serialized_events = []
     for event in events:
         start = event["start"].get("dateTime", event["start"].get("date"))
